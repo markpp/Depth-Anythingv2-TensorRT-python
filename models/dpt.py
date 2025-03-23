@@ -11,6 +11,7 @@ if platform.system() != "Darwin":
     import warnings
     import pycuda.driver as cuda
     import tensorrt as trt
+    print(trt.__version__)
 
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     TRT_LOGGER = trt.Logger()
@@ -56,6 +57,7 @@ class Dpt:
         self._batch_size = batch_size
         self._device_ctx = cuda.Device(gpu_idx).make_context()
         self._engine = self._load_engine(trt_file)
+        #print(dir(self._engine))
         self._context = self._engine.create_execution_context()
         if not dynamic_shape:
             (
@@ -89,57 +91,108 @@ class Dpt:
         bindings = []
         stream = cuda.Stream()
         for binding in self._engine:
-            size = (
-                trt.volume(self._engine.get_binding_shape(binding))
-                * self._engine.max_batch_size
-            )
-            dtype = trt.nptype(self._engine.get_binding_dtype(binding))
+            # Get tensor shape
+            shape = context.get_tensor_shape(binding)  # Dynamic shape support
+            if -1 in shape:  # Dynamic dimension detected
+                raise ValueError(f"Dynamic dimension in shape {shape}. Set input shape in the context before allocation.")
+
+            # Calculate the size of the buffer
+            size = trt.volume(shape)
+            dtype = trt.nptype(self._engine.get_tensor_dtype(binding))
             # Allocate host and device buffers
             host_mem = cuda.pagelocked_empty(size, dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
             # Append the device buffer to device bindings.
             bindings.append(int(device_mem))
             # Append to the appropriate list.
-            if self._engine.binding_is_input(binding):
+            is_input = self._engine.get_tensor_mode(binding) == trt.TensorIOMode.INPUT
+            if is_input:
                 inputs.append(HostDeviceMem(host_mem, device_mem))
             else:
                 outputs.append(HostDeviceMem(host_mem, device_mem))
         return inputs, outputs, bindings, stream
 
-    def trt_infer(self, data):
-        """
-        Real inference process.
-        :param model:   Model objects
-        :param data:    Preprocessed data
-        :return:
-            output
-        """
-        # Copy data to input memory buffer
-        [np.copyto(_inp.host, data.ravel()) for _inp in self._input]
-        # Push to device
-        self._device_ctx.push()
-        # Transfer input data to the GPU.
-        # cuda.memcpy_htod_async(self._input.device, self._input.host, self._stream)
-        [
-            cuda.memcpy_htod_async(inp.device, inp.host, self._stream)
-            for inp in self._input
-        ]
-        # Run inference.
-        self._context.execute_async_v2(
-            bindings=self._bindings, stream_handle=self._stream.handle
-        )
-        # Transfer predictions back from the GPU.
-        # cuda.memcpy_dtoh_async(self._output.host, self._output.device, self._stream)
-        [
-            cuda.memcpy_dtoh_async(out.host, out.device, self._stream)
-            for out in self._output
-        ]
-        # Synchronize the stream
-        self._stream.synchronize()
-        # Pop the device
-        self._device_ctx.pop()
+    if 0:
+        def trt_infer(self, data):
+            """
+            Real inference process.
+            :param model:   Model objects
+            :param data:    Preprocessed data
+            :return:
+                output
+            """
+            # Copy data to input memory buffer
+            [np.copyto(_inp.host, data.ravel()) for _inp in self._input]
+            # Push to device
+            self._device_ctx.push()
+            # Transfer input data to the GPU.
+            # cuda.memcpy_htod_async(self._input.device, self._input.host, self._stream)
+            [
+                cuda.memcpy_htod_async(inp.device, inp.host, self._stream)
+                for inp in self._input
+            ]
+            # Run inference.
+            self._context.execute_async_v3(stream_handle=self._stream.handle)
 
-        return [out.host.reshape(self._batch_size, -1) for out in self._output[::-1]]
+            # Transfer predictions back from the GPU.
+            # cuda.memcpy_dtoh_async(self._output.host, self._output.device, self._stream)
+            [
+                cuda.memcpy_dtoh_async(out.host, out.device, self._stream)
+                for out in self._output
+            ]
+            # Synchronize the stream
+            self._stream.synchronize()
+            # Pop the device
+            self._device_ctx.pop()
+
+            return [out.host.reshape(self._batch_size, -1) for out in self._output[::-1]]
+    else:
+        def trt_infer(self, data):
+            """
+            Real inference process.
+            :param data: Preprocessed data
+            :return: output
+            """
+            # Copy data to input memory buffer
+            [np.copyto(_inp.host, data.ravel()) for _inp in self._input]
+
+            # Push to device
+            self._device_ctx.push()
+
+            # Transfer input data to the GPU
+            for inp in self._input:
+                cuda.memcpy_htod_async(inp.device, inp.host, self._stream)
+
+            # Set tensor address for inputs before inference
+            for i, inp in enumerate(self._input):
+                binding_index = self._bindings[i]  # Get the index directly from bindings list
+
+                # Optionally, retrieve tensor name for debugging purposes (ensure binding_index is used here)
+                tensor_name = self._engine.get_tensor_name(i)  # Correctly pass the index `i` directly
+                print(f"Tensor name: {tensor_name}")
+
+                # Set the tensor address using the binding index
+                self._context.set_tensor_address(tensor_name, binding_index)
+
+            if not self._bindings:
+                raise ValueError("Bindings are not properly set. Check input and output tensor allocations.")
+
+            # Run inference
+            self._context.execute_async_v3(stream_handle=self._stream.handle)
+
+            # Transfer predictions back from the GPU
+            for out in self._output:
+                cuda.memcpy_dtoh_async(out.host, out.device, self._stream)
+                print(out.host)
+
+            # Synchronize the stream
+            self._stream.synchronize()
+
+            # Pop the device
+            self._device_ctx.pop()
+
+            return [out.host.reshape(self._batch_size, -1) for out in self._output[::-1]]
+
 
     def preprocess(self, im):
         """Preprocess core
@@ -169,7 +222,13 @@ class Dpt:
         :return:
             net_out
         """
-        depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+        min_depth, max_depth = depth.min(), depth.max()
+        print(f"Min depth: {min_depth}, Max depth: {max_depth}")
+        # Check if the max and min values of depth are the same
+        if max_depth == min_depth:
+            depth = np.zeros_like(depth)  # Handle the edge case where max == min
+        else: # Normalize depth values to the range [0, 255]
+            depth = (depth - min_depth) / (max_depth - min_depth) * 255.0
         depth = depth.astype(np.uint8)
         depth = cv2.resize(depth, (shape_info[0], shape_info[1]))
         return depth

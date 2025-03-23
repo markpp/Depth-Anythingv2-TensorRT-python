@@ -14,7 +14,7 @@ class EngineBuilder:
         save_path,
         mode,
         log_level="ERROR",
-        max_workspace_size=1,
+        max_workspace_size=1, # GB
         strict_type_constraints=False,
         int8_calibrator=None,
         **kwargs,
@@ -48,6 +48,7 @@ class EngineBuilder:
 
         self.trt_logger = trt.Logger(getattr(trt.Logger, log_level))
         self.builder = trt.Builder(self.trt_logger)
+        print(dir(self.builder))
         self.network = None
         self.max_workspace_size = max_workspace_size
         self.strict_type_constraints = strict_type_constraints
@@ -82,7 +83,7 @@ class EngineBuilder:
 
     def create_engine(self):
         config = self.builder.create_builder_config()
-        config.max_workspace_size = self.max_workspace_size * (1 << 25)
+        #config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8000 << 20)
         if self.mode == "fp16":
             assert self.builder.platform_has_fast_fp16, "not support fp16"
             config.set_flag(trt.BuilderFlag.FP16)
@@ -97,7 +98,7 @@ class EngineBuilder:
         if self.strict_type_constraints:
             config.set_flag(trt.BuilderFlag.STRICT_TYPES)
 
-        config.set_preview_feature(trt.PreviewFeature.FASTER_DYNAMIC_SHAPES_0805, True)
+        #config.set_preview_feature(trt.PreviewFeature.FASTER_DYNAMIC_SHAPES_0805, True)
 
         print(
             f"Building an engine from file {onnx_file_path}; this may take a while..."
@@ -106,12 +107,13 @@ class EngineBuilder:
 
         config.add_optimization_profile(profile)
 
-        engine = self.builder.build_engine(self.network, config)
+        serialized_engine = self.builder.build_serialized_network(self.network, config)
         print("Create engine successfully!")
 
         print(f"Saving TRT engine file to path {self.save_path}")
         with open(self.save_path, "wb") as f:
-            f.write(engine.serialize())
+            #f.write(engine.serialize())
+            f.write(serialized_engine)
         print(f"Engine file has already saved to {self.save_path}!")
 
 
@@ -125,7 +127,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output", default=None, help="The output TensorRT file name")
     parser.add_argument(
-        "--workspace", default=1, type=int, help="The workspace size in bytes"
+        "--workspace", default=3, type=int, help="The workspace size in giga bytes"
     )
     args = parser.parse_args()
 
